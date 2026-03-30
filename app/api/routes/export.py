@@ -262,36 +262,39 @@ async def export_storytelling(body: StorytellingExportRequest):
     if not pages:
         raise HTTPException(status_code=400, detail="Nenhuma página disponível para exportar")
 
-    # Para cada página: exporta PNG e gera storytelling em paralelo
-    pages_data: list[dict] = []
+    # Processa todas as páginas em paralelo (máx 3 exports simultâneos no Power BI)
+    # Fluxo por página: 1) exporta PNG  2) passa imagem para Claude vision → storytelling
+    _semaphore = asyncio.Semaphore(3)
     client = PowerBIClient(PowerBIConfig.from_env())
 
-    try:
-        for page in pages:
-            image_result, storytelling_result = await asyncio.gather(
-                client.export_page_as_image(rid, page.name),
-                generate_page_storytelling(page.display_name, report_name),
-                return_exceptions=True,
-            )
-
-            if isinstance(image_result, Exception):
-                logger.error("Erro ao exportar imagem da página '%s': %s", page.name, image_result)
+    async def _process_page(page: PageForExport) -> dict:
+        async with _semaphore:
+            # Etapa 1 — exporta PNG
+            try:
+                image_bytes = await client.export_page_as_image(rid, page.name)
+            except Exception as exc:
+                logger.error("Erro ao exportar imagem de '%s': %s", page.name, exc)
                 image_bytes = None
-            else:
-                image_bytes = image_result
 
-            if isinstance(storytelling_result, Exception):
-                logger.error("Erro ao gerar storytelling para '%s': %s", page.display_name, storytelling_result)
+            # Etapa 2 — storytelling com visão (usa a imagem obtida)
+            try:
+                storytelling_text = await generate_page_storytelling(
+                    page.display_name, report_name, image_bytes=image_bytes
+                )
+            except Exception as exc:
+                logger.error("Erro ao gerar storytelling de '%s': %s", page.display_name, exc)
                 storytelling_text = f"Análise da tela {page.display_name}."
-            else:
-                storytelling_text = storytelling_result
 
-            pages_data.append({
+            return {
                 "display_name": page.display_name,
                 "storytelling": storytelling_text,
                 "image_bytes": image_bytes,
-            })
+            }
 
+    try:
+        pages_data: list[dict] = list(
+            await asyncio.gather(*[_process_page(p) for p in pages])
+        )
     finally:
         await client.close()
 
