@@ -1,9 +1,17 @@
 """
-Export API — exportação de relatórios Power BI para PDF.
+Export API — PDF export and AI Storytelling.
+
+Endpoints:
+  GET  /pages                      — List report pages (Power BI API)
+  POST /pdf                        — Simple PDF via Playwright screenshots
+  POST /storytelling               — Start async storytelling job
+  GET  /storytelling/{job_id}      — Poll job status/progress
+  GET  /storytelling/{job_id}/download — Download completed PDF
 """
 
 import asyncio
 import datetime
+import io
 import logging
 from io import BytesIO
 from typing import Optional
@@ -15,21 +23,36 @@ from pydantic import BaseModel
 from app.agents.storytelling_agent import generate_page_storytelling
 from app.connectors.powerbi.client import PowerBIClient, PowerBIConfig, PowerBIError
 from app.core.config import settings
+from app.services.job_manager import JobStatus, job_manager
+from app.services.screenshot_service import capture_report_screenshots
+from app.services.storytelling_service import generate_storytelling_pdf
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Request / response models ─────────────────────────────────────────────────
+# ── Request / Response models ─────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    report_id: Optional[str] = None   # usa POWERBI_REPORT_ID do .env se omitido
-    pages: Optional[list[str]] = None  # nomes internos das páginas; None = todas
+    report_id: Optional[str] = None
+    pages: Optional[list[str]] = None
+
+
+class ScreenshotPdfRequest(BaseModel):
+    embed_url: str
+    filters: Optional[dict] = None
+    report_name: str = "Relatório"
+
+
+class StorytellingRequest(BaseModel):
+    embed_url: str
+    filters: Optional[dict] = None
+    report_name: str = "Relatório"
 
 
 class PageInfo(BaseModel):
-    name: str          # nome interno (usado na API)
-    display_name: str  # nome visível ao usuário
+    name: str
+    display_name: str
     order: int
 
 
@@ -42,6 +65,17 @@ class StorytellingExportRequest(BaseModel):
     report_id: Optional[str] = None
     report_name: Optional[str] = None
     pages: Optional[list[PageForExport]] = None  # None = todas as páginas
+
+
+class JobStatusResponse(BaseModel):
+    id: str
+    status: str
+    progress: int
+    total_steps: int
+    current_step: str
+    error: Optional[str] = None
+    created_at: str
+    updated_at: str
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -172,11 +206,9 @@ def _build_storytelling_pdf(
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+
 @router.get("/pages", response_model=list[PageInfo], summary="Lista páginas do relatório")
 async def list_pages(report_id: Optional[str] = None):
-    """
-    Retorna as páginas disponíveis do relatório para seleção no modal de export.
-    """
     rid = report_id or settings.powerbi_report_id
     if not rid:
         raise HTTPException(status_code=400, detail="report_id não configurado")
@@ -199,117 +231,166 @@ async def list_pages(report_id: Optional[str] = None):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.post("/pdf", summary="Exporta relatório para PDF")
-async def export_pdf(body: ExportRequest):
-    """
-    Exporta o relatório (ou páginas selecionadas) para PDF via Power BI API.
-    Retorna o arquivo PDF como download.
-    """
-    rid = body.report_id or settings.powerbi_report_id
-    if not rid:
-        raise HTTPException(status_code=400, detail="report_id não configurado")
+# ── Simple PDF (Playwright screenshots) ──────────────────────────
 
+
+@router.post("/pdf", summary="Gera PDF simples via screenshot do relatório")
+async def export_pdf_screenshot(body: ScreenshotPdfRequest):
+    """
+    Captura screenshots do relatório Power BI embeddado e retorna como PDF.
+    Aceita a URL do iframe (já com filtros) ou filtros OData separados.
+    """
     try:
-        client = PowerBIClient(PowerBIConfig.from_env())
-        pdf_bytes = await client.export_report_to_pdf(
-            report_id=rid,
-            pages=body.pages or None,
+        screenshots = await capture_report_screenshots(
+            embed_url=body.embed_url,
+            filters=body.filters,
         )
-        await client.close()
+
+        if not screenshots:
+            raise HTTPException(status_code=502, detail="Nenhuma página capturada")
+
+        from fpdf import FPDF
+
+        pdf = FPDF(orientation="L", unit="mm", format="A4")
+        for shot in screenshots:
+            pdf.add_page()
+            img_stream = io.BytesIO(shot.image_bytes)
+            pdf.image(img_stream, x=5, y=5, w=287)
+
+        pdf_bytes = pdf.output()
 
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=relatorio.pdf"},
+            headers={
+                "Content-Disposition": f'attachment; filename="{body.report_name}.pdf"'
+            },
         )
-    except PowerBIError as e:
-        logger.error("Erro ao exportar PDF: %s", e)
-        raise HTTPException(status_code=502, detail=str(e))
 
-
-@router.post("/storytelling", summary="Exporta relatório com storytelling de IA em PDF")
-async def export_storytelling(body: StorytellingExportRequest):
-    """
-    Para cada página selecionada:
-    1. Exporta a tela como imagem PNG via Power BI API
-    2. Gera narrativa de storytelling via Claude
-    3. Monta PDF customizado: capa + (narrativa + imagem) por tela
-    """
-    rid = body.report_id or settings.powerbi_report_id
-    if not rid:
-        raise HTTPException(status_code=400, detail="report_id não configurado")
-
-    report_name = body.report_name or "Relatório Power BI"
-
-    # Resolve lista de páginas
-    pages = body.pages
-    if not pages:
-        try:
-            client = PowerBIClient(PowerBIConfig.from_env())
-            pages_raw = await client.list_report_pages(rid)
-            await client.close()
-            pages = [
-                PageForExport(
-                    name=p["name"],
-                    display_name=p.get("displayName", p["name"]),
-                )
-                for p in sorted(pages_raw, key=lambda x: x.get("order", 0))
-            ]
-        except PowerBIError as e:
-            logger.error("Erro ao listar páginas para storytelling: %s", e)
-            raise HTTPException(status_code=502, detail=str(e))
-
-    if not pages:
-        raise HTTPException(status_code=400, detail="Nenhuma página disponível para exportar")
-
-    # Processa todas as páginas em paralelo (máx 3 exports simultâneos no Power BI)
-    # Fluxo por página: 1) exporta PNG  2) passa imagem para Claude vision → storytelling
-    _semaphore = asyncio.Semaphore(3)
-    client = PowerBIClient(PowerBIConfig.from_env())
-
-    async def _process_page(page: PageForExport) -> dict:
-        async with _semaphore:
-            # Etapa 1 — exporta PNG
-            try:
-                image_bytes = await client.export_page_as_image(rid, page.name)
-            except Exception as exc:
-                logger.error("Erro ao exportar imagem de '%s': %s", page.name, exc)
-                image_bytes = None
-
-            # Etapa 2 — storytelling com visão (usa a imagem obtida)
-            try:
-                storytelling_text = await generate_page_storytelling(
-                    page.display_name, report_name, image_bytes=image_bytes
-                )
-            except Exception as exc:
-                logger.error("Erro ao gerar storytelling de '%s': %s", page.display_name, exc)
-                storytelling_text = f"Análise da tela {page.display_name}."
-
-            return {
-                "display_name": page.display_name,
-                "storytelling": storytelling_text,
-                "image_bytes": image_bytes,
-            }
-
-    try:
-        pages_data: list[dict] = list(
-            await asyncio.gather(*[_process_page(p) for p in pages])
-        )
-    finally:
-        await client.close()
-
-    # Monta o PDF
-    try:
-        pdf_bytes = _build_storytelling_pdf(report_name, pages_data)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Erro ao montar PDF de storytelling: %s", e)
+        logger.exception("Erro ao gerar PDF: %s", e)
         raise HTTPException(status_code=500, detail=f"Erro ao gerar PDF: {e}")
 
-    safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in report_name)
-    filename = f"{safe_name}_storytelling.pdf"
+
+# ── Storytelling (async job) ──────────────────────────────────────
+
+
+async def _run_storytelling_job(
+    job_id: str,
+    embed_url: str,
+    filters: Optional[dict],
+    report_name: str,
+):
+    """Background task: screenshots → Claude Vision → PDF."""
+    try:
+        job_manager.update_progress(job_id, 0, "Capturando screenshots do relatório...")
+
+        def on_screenshot_progress(page_idx, total, page_name):
+            job_manager.update_progress(
+                job_id,
+                page_idx,
+                f"Capturando {page_name} ({page_idx + 1}/{total})",
+            )
+
+        screenshots = await capture_report_screenshots(
+            embed_url=embed_url,
+            filters=filters,
+            on_progress=on_screenshot_progress,
+        )
+
+        if not screenshots:
+            job_manager.fail_job(job_id, "Nenhuma página capturada do relatório")
+            return
+
+        # Update total steps now that we know page count
+        job = job_manager.get_job(job_id)
+        if job:
+            job.total_steps = len(screenshots)
+
+        def on_analysis_progress(step_idx, total, step_desc):
+            job_manager.update_progress(job_id, step_idx, step_desc)
+
+        pdf_bytes = await generate_storytelling_pdf(
+            screenshots=screenshots,
+            report_name=report_name,
+            on_progress=on_analysis_progress,
+        )
+
+        job_manager.complete_job(job_id, pdf_bytes)
+        logger.info("Storytelling job %s completed: %d bytes", job_id, len(pdf_bytes))
+
+    except Exception as e:
+        logger.exception("Storytelling job %s failed: %s", job_id, e)
+        job_manager.fail_job(job_id, str(e))
+
+
+@router.post(
+    "/storytelling",
+    summary="Inicia geração de PDF com storytelling (assíncrono)",
+)
+async def start_storytelling(body: StorytellingRequest):
+    """
+    Inicia job assíncrono de storytelling.
+
+    Pipeline:
+    1. Playwright captura screenshots do BI (com filtros)
+    2. Claude Vision analisa cada página e gera narrativa executiva
+    3. fpdf2 monta PDF branded com narrativa + screenshots
+
+    Retorna job_id para polling via GET /storytelling/{job_id}.
+    """
+    job_manager.cleanup_old_jobs()
+    job = job_manager.create_job(total_steps=1)
+
+    asyncio.create_task(
+        _run_storytelling_job(
+            job_id=job.id,
+            embed_url=body.embed_url,
+            filters=body.filters,
+            report_name=body.report_name,
+        )
+    )
+
+    return {"job_id": job.id, "status": "queued"}
+
+
+@router.get(
+    "/storytelling/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Status do job de storytelling",
+)
+async def get_storytelling_status(job_id: str):
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    return job.to_dict()
+
+
+@router.get(
+    "/storytelling/{job_id}/download",
+    summary="Download do PDF de storytelling concluído",
+)
+async def download_storytelling(job_id: str):
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job não concluído (status: {job.status.value})",
+        )
+
+    pdf_bytes = job_manager.get_file(job_id)
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="Arquivo não encontrado")
 
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={
+            "Content-Disposition": f'attachment; filename="storytelling_{job_id}.pdf"'
+        },
     )

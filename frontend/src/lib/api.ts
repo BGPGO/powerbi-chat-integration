@@ -264,6 +264,17 @@ export interface ReportPage {
   order: number;
 }
 
+export interface StorytellingJobStatus {
+  id: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  progress: number;
+  total_steps: number;
+  current_step: string;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export const exportApi = {
   listPages: async (reportId?: string): Promise<ReportPage[]> => {
     const params = reportId ? `?report_id=${reportId}` : '';
@@ -271,31 +282,42 @@ export const exportApi = {
     return response.data;
   },
 
-  exportPdf: async (reportId?: string, pages?: string[]): Promise<Blob> => {
+  exportPdf: async (
+    embedUrl: string,
+    filters?: Record<string, string | string[]>,
+    reportName?: string,
+  ): Promise<Blob> => {
     const response = await api.post(
       '/export/pdf',
-      { report_id: reportId ?? null, pages: pages ?? null },
-      { responseType: 'blob', timeout: 120000 }
+      { embed_url: embedUrl, filters: filters ?? null, report_name: reportName ?? 'Relatório' },
+      { responseType: 'blob', timeout: 180000 },
     );
     return response.data as Blob;
   },
 
-  exportStorytelling: async (
-    reportId?: string,
-    pages?: ReportPage[],
+  startStorytelling: async (
+    embedUrl: string,
+    filters?: Record<string, string | string[]>,
     reportName?: string,
-  ): Promise<Blob> => {
-    const response = await api.post(
-      '/export/storytelling',
-      {
-        report_id: reportId ?? null,
-        report_name: reportName ?? null,
-        pages: pages
-          ? pages.map((p) => ({ name: p.name, display_name: p.display_name }))
-          : null,
-      },
-      { responseType: 'blob', timeout: 300000 }, // 5 min — múltiplas páginas + IA
-    );
+  ): Promise<{ job_id: string; status: string }> => {
+    const response = await api.post('/export/storytelling', {
+      embed_url: embedUrl,
+      filters: filters ?? null,
+      report_name: reportName ?? 'Relatório',
+    });
+    return response.data;
+  },
+
+  getStorytellingStatus: async (jobId: string): Promise<StorytellingJobStatus> => {
+    const response = await api.get<StorytellingJobStatus>(`/export/storytelling/${jobId}`);
+    return response.data;
+  },
+
+  downloadStorytelling: async (jobId: string): Promise<Blob> => {
+    const response = await api.get(`/export/storytelling/${jobId}/download`, {
+      responseType: 'blob',
+      timeout: 30000,
+    });
     return response.data as Blob;
   },
 };

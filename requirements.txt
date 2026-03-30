@@ -22,8 +22,9 @@ sqlalchemy>=2.0.25
 asyncpg>=0.29.0
 alembic>=1.13.1
 
-# PDF Generation
+# PDF & Screenshots
 fpdf2>=2.7.9
+playwright>=1.40.0
 
 # Utilities
 python-dotenv>=1.0.0
