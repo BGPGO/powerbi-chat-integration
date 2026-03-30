@@ -1,0 +1,12 @@
+{
+  "_comment": "Medidas disponíveis para o agente. 'native' = já existe no dataset Power BI, referenciar diretamente. 'custom' = DAX definido aqui, para casos que não existem no modelo.",
+
+  "measures": [
+    {
+      "name": "EBITDA",
+      "type": "native",
+      "description": "Resultado antes de juros, impostos, depreciação e amortização. Já calculado no dataset Power BI.",
+      "aliases": ["ebitda", "resultado operacional", "lucro operacional"]
+    }
+  ]
+}
