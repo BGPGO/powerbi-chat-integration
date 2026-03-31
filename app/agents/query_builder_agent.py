@@ -34,13 +34,13 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
     """
     # Identifica tabela principal de dados
     main_table = None
-    col_names: set = set()  # col_name.lower()
+    col_names: set = set()  # original case
 
     for t in tables:
         tname = t.get("name", "").lower()
         if tname == "data" or (main_table is None and len(t.get("columns", [])) > 5):
             main_table = t.get("name", "data")
-            col_names = {c.get("name", "").lower() for c in t.get("columns", [])}
+            col_names = {c.get("name", "") for c in t.get("columns", [])}
 
     if not main_table:
         return ""
@@ -84,42 +84,107 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
         return f"'{main_table}'[{col_original}] = \"mesANO\" — ex: \"janeiro2024\""
 
     # ── Flags de presença de colunas ──────────────────────────────
+
+    # Colunas de valor/resultado
     has_receita_comp  = "receita competencia" in col_names_lower
     has_despesa_comp  = "despesas competencia" in col_names_lower
-    has_ano_mes_comp  = "ano_mes_competencia" in col_names_lower or "ano_mes competencia" in col_names_lower
-    has_cgrupo        = "cgrupo" in col_names_lower
-    has_previsto      = "previsto/realizado" in col_names_lower
-    has_cnatureza     = "cnatureza" in col_names_lower
-    has_cstatus       = "cstatus" in col_names_lower
     has_receita       = "receita" in col_names_lower
     has_despesas      = "despesas" in col_names_lower
-    has_rec_desp      = "receita/despesa" in col_names_lower  # Conta Azul
+    has_valor_rs      = any(p in col_names_lower for p in ("valor (r$)", "valor r$", "valor(r$)"))
+
+    # Discriminadores de tipo (variam por BI/ERP)
+    has_cnatureza     = "cnatureza" in col_names_lower          # Omie padrão: "R"/"P"
+    has_rec_desp      = "receita/despesa" in col_names_lower    # Conta Azul legado
+    has_tipo_1        = "tipo.1" in col_names_lower             # Burguerclean: "Receita"/"Despesa"
+    has_tipo_operacao = any(p in col_names_lower for p in      # Otero/Conta Azul: "Crédito"
+                           ("tipo da operação", "tipo da operacao"))
+
+    # Colunas de status/regime
+    has_cstatus       = "cstatus" in col_names_lower
     has_situacao      = "situação" in col_names_lower or "situacao" in col_names_lower
-    has_ano           = "ano " in col_names_lower  # "Ano " com espaço (Omie)
+    has_cgrupo        = "cgrupo" in col_names_lower
+    has_previsto      = "previsto/realizado" in col_names_lower
+
+    # Colunas de período — período texto combinado
+    has_ano           = "ano " in col_names_lower               # Omie padrão: "Ano " com espaço
+    has_ano_mes_comp  = "ano_mes_competencia" in col_names_lower or "ano_mes competencia" in col_names_lower
     has_ano_mes_cx    = "ano_mes" in col_names_lower or "ano_mes_caixa" in col_names_lower
     has_nome_mes      = "nome mês" in col_names_lower or "nome mes" in col_names_lower
 
-    # Nomes originais das colunas de período (variam por sistema)
+    # Colunas de data — variam muito por BI
+    has_data_auxiliar    = "data auxiliar" in col_names_lower        # Omie: data caixa alternativa
+    has_data_pagamento   = "datapagamento" in col_names_lower or "data pagamento" in col_names_lower
+    has_ddt_venc         = "ddtvenc" in col_names_lower              # Omie: data vencimento (competência)
+    has_data_vencimento  = any(p in col_names_lower for p in         # Burguerclean: data caixa
+                              ("data de vencimento", "data vencimento"))
+    has_data_emissao     = any(p in col_names_lower for p in         # Burguerclean: data competência
+                              ("data de emissão", "data de emissao", "data emissão", "data emissao"))
+    has_data_competencia_col = any(p in col_names_lower for p in     # Otero: data competência
+                                  ("data de competência", "data de competencia",
+                                   "data competência", "data competencia"))
+    has_data_movimento   = "data movimento" in col_names_lower       # Otero: data caixa
+    # "Data" simples — usado como competência quando não há coluna mais específica
+    has_data_plain       = ("data" in col_names_lower
+                            and not has_ddt_venc
+                            and not has_data_vencimento
+                            and not has_data_emissao
+                            and not has_data_competencia_col)
+
+    # Nomes originais das colunas de período texto
     ano_mes_comp_col  = _orig("ano_mes competencia") if "ano_mes competencia" in col_names_lower else _orig("ano_mes_competencia")
     ano_mes_cx_col    = _orig("ano_mes") if "ano_mes" in col_names_lower else _orig("ano_mes_caixa")
 
+    # ── Resolve coluna de valor base ───────────────────────────────
+    # Prioriza colunas calculadas já prontas; fallback para valor bruto
+    value_col = "receita"   # default — a maioria dos BIs tem essa coluna calculada
+    if has_valor_rs and not has_receita:
+        value_col = _orig(next(p for p in ("valor (r$)", "valor r$", "valor(r$)") if p in col_names_lower))
+
+    # ── Resolve discriminador de tipo ──────────────────────────────
+    # Emite nota sobre qual coluna discrimina receita vs despesa neste BI
+    if has_tipo_1:
+        tipo_col = _orig("tipo.1")
+        rules.append(f"- DISCRIMINADOR TIPO: coluna [{tipo_col}] = \"Receita\" | \"Despesa\"")
+    elif has_tipo_operacao:
+        tipo_col = _orig("tipo da operação") if "tipo da operação" in col_names_lower else _orig("tipo da operacao")
+        rules.append(f"- DISCRIMINADOR TIPO: coluna [{tipo_col}] = \"Crédito\" (receita) | outros (despesa)")
+    elif has_rec_desp:
+        tipo_col = _orig("receita/despesa")
+        rules.append(f"- DISCRIMINADOR TIPO: coluna [{tipo_col}] = \"Receita\" | \"Despesa\"")
+    elif has_cnatureza:
+        rules.append(f"- DISCRIMINADOR TIPO: [{_orig('cnatureza')}] = \"R\" (receita) | \"P\" (despesa)")
+
     # ── Regras de receita ──────────────────────────────────────────
     if has_receita_comp and has_cgrupo and has_previsto:
-        # Omie: receita de competência com filtro de grupo e realizado
         rules.append(
             f"- RECEITA/FATURAMENTO (competência) = "
             f"CALCULATE(SUM('{main_table}'[{_orig('receita competencia')}]), "
             f"'{main_table}'[{_orig('cgrupo')}] = \"CONTA_A_RECEBER\", "
             f"'{main_table}'[{_orig('previsto/realizado')}] = \"Realizado\")"
         )
+    elif has_receita and has_tipo_operacao:
+        # Otero/Conta Azul com Tipo da operação
+        tipo_col = _orig("tipo da operação") if "tipo da operação" in col_names_lower else _orig("tipo da operacao")
+        rules.append(
+            f"- RECEITA (colunas calculadas já filtram, mas se precisar filtrar explicitamente): "
+            f"CALCULATE(SUM('{main_table}'[receita]), '{main_table}'[{tipo_col}] = \"Crédito\")"
+        )
+        rules.append(f"- RECEITA SIMPLES = SUM('{main_table}'[receita])")
+    elif has_receita and has_tipo_1:
+        # Burguerclean
+        tipo_col = _orig("tipo.1")
+        rules.append(
+            f"- RECEITA = SUM('{main_table}'[{_orig('receita')}])  ← coluna calculada já filtra Tipo.1='Receita'"
+        )
+        rules.append(
+            f"- FATURAMENTO (competência) = SUM('{main_table}'[{_orig('receita competencia') if has_receita_comp else _orig('receita')}])"
+        )
     elif has_receita and has_rec_desp:
-        # Conta Azul: filtra pela coluna Receita/Despesa
         rules.append(
             f"- RECEITA = CALCULATE(SUM('{main_table}'[{_orig('receita')}]), "
             f"'{main_table}'[{_orig('receita/despesa')}] = \"Receita\")"
         )
     elif has_receita and has_cnatureza:
-        # Genérico com cNatureza
         rules.append(
             f"- RECEITA = CALCULATE(SUM('{main_table}'[{_orig('receita')}]), "
             f"'{main_table}'[{_orig('cnatureza')}] = \"R\")"
@@ -135,6 +200,15 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
             f"'{main_table}'[{_orig('cgrupo')}] = \"CONTA_A_PAGAR\", "
             f"'{main_table}'[{_orig('previsto/realizado')}] = \"Realizado\")"
         )
+    elif has_despesas and has_tipo_operacao:
+        tipo_col = _orig("tipo da operação") if "tipo da operação" in col_names_lower else _orig("tipo da operacao")
+        rules.append(
+            f"- DESPESAS = SUM('{main_table}'[despesas])  ← coluna calculada (valores negativos em alguns BIs)"
+        )
+    elif has_despesas and has_tipo_1:
+        rules.append(
+            f"- DESPESAS = SUM('{main_table}'[{_orig('despesas')}])  ← coluna calculada já filtra Tipo.1='Despesa'"
+        )
     elif has_despesas and has_rec_desp:
         rules.append(
             f"- DESPESAS = CALCULATE(SUM('{main_table}'[{_orig('despesas')}]), "
@@ -149,45 +223,68 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
         rules.append(f"- DESPESAS = SUM('{main_table}'[{_orig('despesas')}])")
 
     # ── Regras de resultado ────────────────────────────────────────
-    if has_receita_comp and has_despesa_comp and has_cgrupo and has_previsto:
-        rules.append(
-            f"- RESULTADO/LUCRO = RECEITA (competência) - DESPESAS (competência) — use as fórmulas acima"
-        )
-    elif has_receita and has_despesas:
-        rules.append(f"- RESULTADO/LUCRO = SUM receita - SUM despesas (com filtros apropriados acima)")
+    if has_receita and has_despesas:
+        rules.append(f"- RESULTADO/LUCRO = SUM('{main_table}'[receita]) - SUM('{main_table}'[despesas])")
 
-    # ── Caixa / recebimentos ───────────────────────────────────────
-    if has_receita and has_cstatus:
+    # ── Status / regime de caixa ───────────────────────────────────
+    if has_cstatus:
         rules.append(
-            f"- RECEBIMENTOS CAIXA = CALCULATE(SUM('{main_table}'[{_orig('receita')}]), "
-            f"'{main_table}'[{_orig('cstatus')}] IN {{\"PAGO\", \"RECEBIDO\"}})"
-        )
-
-    # ── Filtros de cancelado/status ────────────────────────────────
-    if has_previsto:
-        rules.append(
-            f"- EXCLUIR CANCELADOS = '{main_table}'[{_orig('previsto/realizado')}] <> \"Cancelado\""
+            f"- CAIXA (Omie): '{main_table}'[{_orig('cstatus')}] IN {{\"PAGO\", \"RECEBIDO\"}}"
         )
     if has_situacao:
         situ_col = _orig("situação") if "situação" in col_names_lower else _orig("situacao")
-        rules.append(f"- STATUS do registro: coluna [{situ_col}] — ex: \"Em aberto\", \"Pago\", \"Vencido\"")
+        rules.append(f"- STATUS: [{situ_col}] — ex: \"Pago\", \"Recebido\", \"Em aberto\", \"Vencido\", \"Cancelado\"")
+        rules.append(f"- CAIXA (Conta Azul): '{main_table}'[{situ_col}] IN {{\"Pago\", \"Recebido\"}}")
+    if has_previsto:
+        rules.append(
+            f"- EXCLUIR CANCELADOS: '{main_table}'[{_orig('previsto/realizado')}] <> \"Cancelado\""
+        )
     if has_cnatureza:
         rules.append(f"- [{_orig('cnatureza')}]: \"R\"=receita, \"P\"=despesa — NUNCA \"D\"")
 
-    # ── Filtros de período ─────────────────────────────────────────
+    # ── Colunas de data identificadas neste BI ─────────────────────
+    rules.append("\n### COLUNAS DE DATA DISPONÍVEIS NESTE BI:")
+
+    # Caixa (data de pagamento efetivo) — prioridade: movimento > pagamento > vencimento > auxiliar
+    if has_data_movimento:
+        rules.append(f"- DATA CAIXA: '{main_table}'[{_orig('data movimento')}]")
+        if "data caixa" in col_names_lower:
+            rules.append(f"  AVISO: coluna 'data caixa' armazena Unix timestamp inteiro — NÃO usar para filtros de data")
+    elif has_data_pagamento:
+        col = _orig("datapagamento") if "datapagamento" in col_names_lower else _orig("data pagamento")
+        rules.append(f"- DATA CAIXA: '{main_table}'[{col}]")
+    elif has_data_vencimento:
+        col = next((_orig(p) for p in ("data de vencimento", "data vencimento") if p in col_names_lower), "data de vencimento")
+        rules.append(f"- DATA CAIXA: '{main_table}'[{col}]")
+    elif has_data_auxiliar:
+        rules.append(f"- DATA CAIXA: '{main_table}'[{_orig('data auxiliar')}]")
+
+    # Competência (data de vencimento/emissão/lançamento)
+    if has_data_competencia_col:
+        col = next((_orig(p) for p in ("data de competência", "data de competencia", "data competência", "data competencia") if p in col_names_lower), "data de competência")
+        rules.append(f"- DATA COMPETÊNCIA: '{main_table}'[{col}]")
+    elif has_ddt_venc:
+        rules.append(f"- DATA COMPETÊNCIA: '{main_table}'[{_orig('ddtvenc')}]")
+    elif has_data_emissao:
+        col = next((_orig(p) for p in ("data de emissão", "data de emissao", "data emissão", "data emissao") if p in col_names_lower), "data de emissão")
+        rules.append(f"- DATA COMPETÊNCIA: '{main_table}'[{col}]")
+    elif has_data_plain:
+        rules.append(f"- DATA COMPETÊNCIA: '{main_table}'[{_orig('data')}]")
+
+    # ── Filtros de período texto (ano_mes) ─────────────────────────
     if has_ano_mes_comp:
         rules.append(f"- FILTRO ANO (competência): {_year_filter(ano_mes_comp_col)}")
         rules.append(f"- FILTRO MÊS (competência): {_month_filter(ano_mes_comp_col)}")
     if has_ano:
         rules.append(
-            f"- FILTRO ANO (caixa): '{main_table}'[{_orig('ano ')}] = \"XXXX\" — coluna tem ESPAÇO no final"
+            f"- FILTRO ANO (texto): '{main_table}'[{_orig('ano ')}] = \"XXXX\" — coluna tem ESPAÇO no final"
         )
     if has_ano_mes_cx and not has_ano:
-        rules.append(f"- FILTRO ANO (caixa): {_year_filter(ano_mes_cx_col)}")
+        rules.append(f"- FILTRO ANO (caixa texto): {_year_filter(ano_mes_cx_col)}")
     if has_nome_mes:
         nome_mes_col = _orig('nome mês') if 'nome mês' in col_names_lower else _orig('nome mes')
         rules.append(
-            f"- FILTRO MÊS (caixa): '{main_table}'[{nome_mes_col}] = \"MêsCapitalizado\" — ex: \"Janeiro\""
+            f"- FILTRO MÊS (texto): '{main_table}'[{nome_mes_col}] = \"MêsCapitalizado\" — ex: \"Janeiro\""
         )
 
     rules.append("")
@@ -254,7 +351,7 @@ REGRA CRÍTICA DE FORMATO JSON:
 """
 
     DAX_GENERATION_PROMPT = """
-    Com base no modelo de dados Omie e na pergunta do usuário, gere uma query DAX precisa.
+    Com base no modelo de dados e na pergunta do usuário, gere uma query DAX precisa.
 
     PERGUNTA: {question}
 
@@ -343,9 +440,10 @@ REGRA CRÍTICA DE FORMATO JSON:
         from app.core.custom_measures import get_custom_measures_prompt
         custom_measures = get_custom_measures_prompt()
 
-        # Base: sempre inclui as regras invioláveis + contexto Omie estático
+        # Base: usa o contexto semântico já injetado pelo orchestrator (Omie ou Conta Azul).
+        # Fallback para Omie estático apenas se não vier nada do orchestrator.
         base_prompt = QueryBuilderAgent.SYSTEM_PROMPT.format(
-            omie_context=omie_context or get_omie_context(),
+            omie_context=omie_context if omie_context else get_omie_context(),
             custom_measures=custom_measures or "",
         )
 

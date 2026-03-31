@@ -171,14 +171,21 @@ SEMANTIC_MAPPINGS = """
 
 ### MÉTRICAS PRINCIPAIS
 
-**Faturamento / Receita / Total de receitas:**
-→ `SUM('data'[receita])`
+**DISTINÇÃO CRÍTICA — Faturamento vs Receita:**
+- **Faturamento** = regime de COMPETÊNCIA → todos os títulos (qualquer status, exceto CANCELADO), data via `dDtVenc`
+- **Receita** = regime de CAIXA → somente títulos PAGO ou RECEBIDO, data via `DataPagamento`
+
+**Faturamento / Faturamento total / Faturamento bruto / Total faturado:**
+→ `SUM('data'[receita])` — sem filtro de cStatus (inclui todos os títulos, exceto CANCELADO quando explícito)
 → Já inclui rateio. Não use `nValorTitulo` diretamente.
+→ Use `dDtVenc` como coluna de data para filtros de período.
 
-**Receita de títulos já recebidos (caixa):**
+**Receita / Receita recebida / Receita realizada / Receita em caixa / Entrada de caixa:**
 → `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})`
+→ Somente títulos efetivamente recebidos.
+→ Use `DataPagamento` como coluna de data para filtros de período.
 
-**Receita prevista / a receber (competência):**
+**Receita prevista / a receber / pendente (competência):**
 → `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"A VENCER", "ATRASADO", "VENCE HOJE", "PREVISAO"})`
 
 **Despesa total / Custos:**
@@ -272,37 +279,56 @@ Julho, Agosto, Setembro, Outubro, Novembro, Dezembro
 DAX_EXAMPLES = """
 ## EXEMPLOS CONCRETOS — PERGUNTA → DAX
 
-### Q: "Qual o faturamento total de 2026?"
+### Q: "Qual o faturamento total de 2026?" (competência — dDtVenc, todos os status)
 ```dax
 EVALUATE
 ROW(
-    "Faturamento 2026", CALCULATE(SUM('data'[receita]), 'data'[Ano ] = "2026")
+    "Faturamento 2026",
+    CALCULATE(
+        SUM('data'[receita]),
+        'data'[dDtVenc] >= DATE(2026,1,1),
+        'data'[dDtVenc] <= DATE(2026,12,31)
+    )
 )
 ```
 
-### Q: "Qual a receita recebida em caixa em 2026?"
+### Q: "Qual a receita de 2026?" / "Quanto recebemos em 2026?" (caixa — DataPagamento, PAGO/RECEBIDO)
 ```dax
 EVALUATE
 ROW(
     "Receita Caixa 2026",
     CALCULATE(
         SUM('data'[receita]),
-        'data'[Ano ] = "2026",
+        'data'[DataPagamento] >= DATE(2026,1,1),
+        'data'[DataPagamento] <= DATE(2026,12,31),
         'data'[cStatus] IN {"PAGO", "RECEBIDO"}
     )
 )
 ```
 
-### Q: "Mostre receita e despesa por mês em 2026"
+### Q: "Mostre faturamento e despesa por mês em 2026" (competência — dDtVenc)
 ```dax
 EVALUATE
 SUMMARIZECOLUMNS(
     'data'[Nome mês],
     'data'[Ano ],
     FILTER(ALL('data'), 'data'[Ano ] = "2026"),
-    "Receita", SUM('data'[receita]),
+    "Faturamento", SUM('data'[receita]),
     "Despesa", SUM('data'[despesas]),
     "Resultado", SUM('data'[receita]) - SUM('data'[despesas])
+)
+```
+
+### Q: "Mostre receita e despesa por mês em 2026" (caixa — DataPagamento, PAGO/RECEBIDO)
+```dax
+EVALUATE
+SUMMARIZECOLUMNS(
+    'data'[Nome mês],
+    'data'[Ano ],
+    FILTER(ALL('data'), 'data'[Ano ] = "2026" && 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
+    "Receita", CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
+    "Despesa", CALCULATE(SUM('data'[despesas]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
+    "Resultado", CALCULATE(SUM('data'[receita]) - SUM('data'[despesas]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})
 )
 ```
 
@@ -447,7 +473,12 @@ CRITICAL_RULES = """
 10. **Não recriar lógica das colunas calculadas** — use as colunas `receita`, `despesas`,
     `Valor único` e `pct rateio new` diretamente, pois já existem na tabela `data`
 
-11. **`data[valor]` NÃO EXISTE** — a coluna correta de receita é `data[receita]` e de despesa é `data[despesas]`.
+11. **FATURAMENTO ≠ RECEITA — regimes contábeis diferentes:**
+    - **Faturamento** = competência: `SUM('data'[receita])` SEM filtro de cStatus, data via `dDtVenc`
+    - **Receita** = caixa: `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})`, data via `DataPagamento`
+    - NUNCA use a mesma fórmula para as duas palavras.
+
+12. **`data[valor]` NÃO EXISTE** — a coluna correta de receita é `data[receita]` e de despesa é `data[despesas]`.
     Nunca gere `data[valor]`, `data[Valor]`, `data[total]` ou qualquer variação.
     Sempre use `SUM('data'[receita])` para receitas e `SUM('data'[despesas])` para despesas.
 

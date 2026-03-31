@@ -59,7 +59,12 @@ class AppSettings(BaseSettings):
         return self
 
     def get_reports(self) -> list[dict[str, Any]]:
-        """Retorna a lista de relatórios configurados."""
+        """
+        Retorna a lista de relatórios configurados.
+        Cada entrada inclui `erp_type` ("omie" | "conta_azul") para seleção
+        automática do dicionário semântico correto no chat.
+        Para adicionar novos clientes: copie um bloco e preencha os campos.
+        """
         return [
             {
                 "name": "bi_Eco - Burguerclean",
@@ -67,6 +72,7 @@ class AppSettings(BaseSettings):
                 "workspace_id": "0093193a-09c6-4371-b2de-5577cd912e90",
                 "dataset_id": "eeaa8d72-7549-4470-8a1d-62a5590666c1",
                 "report_id": "6e3f3942-be95-455d-aa1f-ff28f638b1a1",
+                "erp_type": "omie",
             },
             {
                 "name": "BI_JOTA - Omie",
@@ -74,6 +80,7 @@ class AppSettings(BaseSettings):
                 "workspace_id": "0093193a-09c6-4371-b2de-5577cd912e90",
                 "dataset_id": "d19fb6a1-d17c-4b59-a7d3-4ac36c5e9af1",
                 "report_id": "28b18343-3c09-4562-b86a-b7e5a0bec5bb",
+                "erp_type": "omie",
             },
             {
                 "name": "BI_Otero - Conta Azul",
@@ -81,8 +88,19 @@ class AppSettings(BaseSettings):
                 "workspace_id": "0093193a-09c6-4371-b2de-5577cd912e90",
                 "dataset_id": "ca26e66f-6bbd-4273-9de7-9e13e720c839",
                 "report_id": "d952633f-26b1-4f57-8abc-8189f1636ac3",
+                "erp_type": "conta_azul",
             },
         ]
+
+    def get_erp_type(self, dataset_id: str) -> str:
+        """
+        Retorna o tipo de ERP ("omie" | "conta_azul") para um dataset_id.
+        Fallback: "omie".
+        """
+        for r in self.get_reports():
+            if r.get("dataset_id") == dataset_id:
+                return r.get("erp_type", "omie")
+        return "omie"
 
 
 @lru_cache

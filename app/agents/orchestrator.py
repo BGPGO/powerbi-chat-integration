@@ -435,6 +435,23 @@ Responda APENAS com a categoria em maiúsculas."""
         else:
             context_blocks.append("Schema ainda sendo carregado. Informe ao usuário que o sistema está inicializando.")
 
+        # Injeta dicionário semântico estático do ERP correto para este cliente
+        dataset_id = schema.get("dataset_id") or state.get("dataset_id") or ""
+        erp_type = "omie"
+        try:
+            from app.core.config import get_settings as _get_settings
+            erp_type = _get_settings().get_erp_type(dataset_id)
+        except Exception:
+            pass
+
+        if erp_type == "conta_azul":
+            from app.agents.conta_azul_dictionary import get_conta_azul_context
+            context_blocks.append(get_conta_azul_context())
+            logger.info("translate_schema: dicionário Conta Azul injetado (dataset=%s)", dataset_id)
+        else:
+            context_blocks.append(get_omie_context())
+            logger.info("translate_schema: dicionário Omie injetado (dataset=%s)", dataset_id)
+
         schema_with_context = {
             **schema,
             "omie_context": "\n\n".join(context_blocks),
