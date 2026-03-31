@@ -172,21 +172,22 @@ SEMANTIC_MAPPINGS = """
 ### MÉTRICAS PRINCIPAIS
 
 **DISTINÇÃO CRÍTICA — Faturamento vs Receita:**
-- **Faturamento** = regime de COMPETÊNCIA → todos os títulos (qualquer status, exceto CANCELADO), data via `dDtVenc`
-- **Receita** = regime de CAIXA → somente títulos PAGO ou RECEBIDO, data via `DataPagamento`
+- **Faturamento** = regime de COMPETÊNCIA → todos os títulos (qualquer status, exceto CANCELADO), data via `ano_mes_competencia` ou `dDtVenc`
+- **Receita** = regime de CAIXA → movimentos bancários efetivos, filtro `cGrupo="CONTA_CORRENTE_REC"` + `cOrigem IN {"BAXR","EXTR"}`, data via `ano_mes_caixa` ou `DataPagamento`
 
 **Faturamento / Faturamento total / Faturamento bruto / Total faturado:**
-→ `SUM('data'[receita])` — sem filtro de cStatus (inclui todos os títulos, exceto CANCELADO quando explícito)
+→ `CALCULATE(SUM('data'[receita]), 'data'[cStatus] <> "CANCELADO")` — todos os títulos exceto cancelados
 → Já inclui rateio. Não use `nValorTitulo` diretamente.
-→ Use `dDtVenc` como coluna de data para filtros de período.
+→ Use `ano_mes_competencia` (ex: "janeiro2025") ou `dDtVenc` como coluna de data.
 
 **Receita / Receita recebida / Receita realizada / Receita em caixa / Entrada de caixa:**
-→ `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})`
-→ Somente títulos efetivamente recebidos.
-→ Use `DataPagamento` como coluna de data para filtros de período.
+→ `CALCULATE(SUM('data'[receita]), 'data'[cGrupo] = "CONTA_CORRENTE_REC", 'data'[cOrigem] IN {"BAXR","EXTR"})`
+→ Somente movimentos bancários efetivos (exclui transferências TRAR que são dupla contagem).
+→ Use `ano_mes_caixa` (ex: "janeiro2025") ou `DataPagamento` como coluna de data.
 
 **Receita prevista / a receber / pendente (competência):**
 → `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"A VENCER", "ATRASADO", "VENCE HOJE", "PREVISAO"})`
+→ Use `dDtVenc` ou `ano_mes_competencia` como data.
 
 **Despesa total / Custos:**
 → `SUM('data'[despesas])`
@@ -222,15 +223,21 @@ Julho, Agosto, Setembro, Outubro, Novembro, Dezembro
 
 ### REGIME CONTÁBIL
 
-**Regime de CAIXA (dinheiro que de fato entrou/saiu):**
-→ Filtrar `'data'[cStatus] IN {"PAGO", "RECEBIDO"}`
-→ Usar `DataPagamento` como coluna de data
-→ Ou usar `tabela_mes_caixa` para resumos mensais
+**Regime de CAIXA (dinheiro que de fato entrou/saiu — RECEITA):**
+→ Filtrar `'data'[cGrupo] = "CONTA_CORRENTE_REC"` E `'data'[cOrigem] IN {"BAXR","EXTR"}`
+→ Usar `ano_mes_caixa` (ex: "janeiro2025") ou `DataPagamento` como coluna de data
+→ NUNCA use apenas `cStatus IN {"PAGO","RECEBIDO"}` para receita — causa dupla contagem!
 
 **Regime de COMPETÊNCIA (vencimentos, DRE, provisões):**
-→ Sem filtro de status (inclui todos exceto CANCELADO)
-→ Usar `dDtVenc` como coluna de data
+→ Filtrar `'data'[cStatus] <> "CANCELADO"` (ou sem filtro de status)
+→ Usar `ano_mes_competencia` (ex: "janeiro2025") ou `dDtVenc` como coluna de data
 → Ou usar `tabela_mes_competencia` para resumos mensais
+
+**cOrigem — valores do campo:**
+- `"BAXR"` = Baixa de conta a receber (pagamento de título AR) → contar como caixa
+- `"EXTR"` = Extrato bancário (crédito direto sem título) → contar como caixa
+- `"TRAR"` = Transferência entre contas próprias → NÃO é receita, excluir sempre
+- `"VENR"` = Venda/faturamento (lado do título AR) → usar para competência, não caixa
 
 **Padrão (sem especificação):** use competência.
 
@@ -292,16 +299,17 @@ ROW(
 )
 ```
 
-### Q: "Qual a receita de 2026?" / "Quanto recebemos em 2026?" (caixa — DataPagamento, PAGO/RECEBIDO)
+### Q: "Qual a receita de 2026?" / "Quanto recebemos em 2026?" (caixa — CCAREC + BAXR/EXTR)
 ```dax
 EVALUATE
 ROW(
     "Receita Caixa 2026",
     CALCULATE(
         SUM('data'[receita]),
+        'data'[cGrupo] = "CONTA_CORRENTE_REC",
+        'data'[cOrigem] IN {"BAXR", "EXTR"},
         'data'[DataPagamento] >= DATE(2026,1,1),
-        'data'[DataPagamento] <= DATE(2026,12,31),
-        'data'[cStatus] IN {"PAGO", "RECEBIDO"}
+        'data'[DataPagamento] <= DATE(2026,12,31)
     )
 )
 ```
@@ -319,16 +327,18 @@ SUMMARIZECOLUMNS(
 )
 ```
 
-### Q: "Mostre receita e despesa por mês em 2026" (caixa — DataPagamento, PAGO/RECEBIDO)
+### Q: "Mostre receita e despesa por mês em 2026" (caixa — CCAREC/BAXR/EXTR)
 ```dax
 EVALUATE
 SUMMARIZECOLUMNS(
-    'data'[Nome mês],
-    'data'[Ano ],
-    FILTER(ALL('data'), 'data'[Ano ] = "2026" && 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
-    "Receita", CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
-    "Despesa", CALCULATE(SUM('data'[despesas]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"}),
-    "Resultado", CALCULATE(SUM('data'[receita]) - SUM('data'[despesas]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})
+    'data'[ano_mes_caixa],
+    FILTER(ALL('data'),
+        RIGHT('data'[ano_mes_caixa], 4) = "2026"
+        && 'data'[ano_mes_caixa] <> BLANK()
+        && 'data'[cGrupo] = "CONTA_CORRENTE_REC"
+        && 'data'[cOrigem] IN {"BAXR", "EXTR"}
+    ),
+    "Receita", SUM('data'[receita])
 )
 ```
 
@@ -452,7 +462,7 @@ CRITICAL_RULES = """
    - `"R"` = Receita
    - `"P"` = Despesa/Pagamento  ← NÃO é "D"
 
-3. **Liquidado/pago NÃO usa `cLiquidado`** — usa `cStatus IN {"PAGO", "RECEBIDO"}`
+3. **Liquidado/pago NÃO usa `cLiquidado`** — usa o filtro correto de caixa (veja regra 13)
 
 4. **`cStatus`** — valores possíveis:
    `A VENCER`, `ATRASADO`, `CANCELADO`, `PAGO`, `PREVISAO`, `RECEBIDO`, `VENCE HOJE`
@@ -474,18 +484,36 @@ CRITICAL_RULES = """
     `Valor único` e `pct rateio new` diretamente, pois já existem na tabela `data`
 
 11. **FATURAMENTO ≠ RECEITA — regimes contábeis diferentes:**
-    - **Faturamento** = competência: `SUM('data'[receita])` SEM filtro de cStatus, data via `dDtVenc`
-    - **Receita** = caixa: `CALCULATE(SUM('data'[receita]), 'data'[cStatus] IN {"PAGO", "RECEBIDO"})`, data via `DataPagamento`
+    - **Faturamento** = competência: `SUM('data'[receita])` filtrado por `cStatus <> "CANCELADO"`, data via `ano_mes_competencia`
+    - **Receita** = caixa: filtro `cGrupo="CONTA_CORRENTE_REC"` + `cOrigem IN {"BAXR","EXTR"}`, data via `ano_mes_caixa`
     - NUNCA use a mesma fórmula para as duas palavras.
 
 12. **`data[valor]` NÃO EXISTE** — a coluna correta de receita é `data[receita]` e de despesa é `data[despesas]`.
     Nunca gere `data[valor]`, `data[Valor]`, `data[total]` ou qualquer variação.
     Sempre use `SUM('data'[receita])` para receitas e `SUM('data'[despesas])` para despesas.
 
-12. **Para perguntas com janela temporal** ("última semana", "últimas N semanas", "últimos N dias"):
+13. **RECEITA CAIXA — filtro correto (CRÍTICO — evita dupla contagem):**
+    O modelo Omie registra cada pagamento em DUAS linhas simultâneas:
+    - `cGrupo="CONTA_A_RECEBER"` + `cOrigem="VENR"` + `cStatus="RECEBIDO"` — lado do título (contas a receber)
+    - `cGrupo="CONTA_CORRENTE_REC"` + `cOrigem="BAXR"` — lado do banco (movimento de caixa)
+    Usar `cStatus IN {"PAGO","RECEBIDO"}` soma AMBAS as linhas → DUPLA CONTAGEM!
+    **Fórmula correta:**
+    ```
+    CALCULATE(SUM('data'[receita]),
+        'data'[cGrupo] = "CONTA_CORRENTE_REC",
+        'data'[cOrigem] IN {"BAXR", "EXTR"},
+        'data'[ano_mes_caixa] = "janeiro2025")
+    ```
+    - `BAXR` = Baixa de conta a receber (pagamento de título AR)
+    - `EXTR` = Extrato bancário (crédito direto sem título AR)
+    - `TRAR` = Transferência entre contas próprias → EXCLUIR (não é receita)
+    - Para filtro de data: usar `ano_mes_caixa` (ex: "janeiro2025") OU `DataPagamento`
+
+14. **Para perguntas com janela temporal** ("última semana", "últimas N semanas", "últimos N dias"):
     - Use `TODAY()` como referência de data atual
-    - Para caixa (pago/recebido): `'data'[DataPagamento] >= TODAY() - N && 'data'[DataPagamento] <= TODAY()`
-    - Para competência/vencimento: `'data'[dDtVenc] >= TODAY() - N && 'data'[dDtVenc] <= TODAY()`
+    - Para caixa: `'data'[DataPagamento] >= TODAY() - N && 'data'[DataPagamento] <= TODAY()`
+      com `'data'[cGrupo] = "CONTA_CORRENTE_REC"` e `'data'[cOrigem] IN {"BAXR","EXTR"}`
+    - Para competência: `'data'[dDtVenc] >= TODAY() - N && 'data'[dDtVenc] <= TODAY()`
     - Semana = 7 dias, 2 semanas = 14 dias, mês = 30 dias
     - NUNCA use funções como DATEADD sem confirmar que a tabela de datas está configurada
 """

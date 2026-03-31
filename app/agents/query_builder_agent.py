@@ -103,6 +103,7 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
     has_cstatus       = "cstatus" in col_names_lower
     has_situacao      = "situação" in col_names_lower or "situacao" in col_names_lower
     has_cgrupo        = "cgrupo" in col_names_lower
+    has_corigem       = "corigem" in col_names_lower
     has_previsto      = "previsto/realizado" in col_names_lower
 
     # Colunas de período — período texto combinado
@@ -156,12 +157,21 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
 
     # ── Regras de receita ──────────────────────────────────────────
     if has_receita_comp and has_cgrupo and has_previsto:
+        # Omie/Jota: receita competência via cGrupo + cStatus
         rules.append(
-            f"- RECEITA/FATURAMENTO (competência) = "
+            f"- FATURAMENTO (competência) = "
             f"CALCULATE(SUM('{main_table}'[{_orig('receita competencia')}]), "
-            f"'{main_table}'[{_orig('cgrupo')}] = \"CONTA_A_RECEBER\", "
-            f"'{main_table}'[{_orig('previsto/realizado')}] = \"Realizado\")"
+            f"'{main_table}'[{_orig('cnatureza')}] = \"R\", "
+            f"'{main_table}'[{_orig('cstatus')}] <> \"CANCELADO\")"
         )
+        if has_corigem:
+            # Omie: caixa via CONTA_CORRENTE_REC + cOrigem (evita dupla contagem)
+            rules.append(
+                f"- RECEITA (caixa) = "
+                f"CALCULATE(SUM('{main_table}'[{_orig('receita')}]), "
+                f"'{main_table}'[{_orig('cgrupo')}] = \"CONTA_CORRENTE_REC\", "
+                f"'{main_table}'[{_orig('corigem')}] IN {{\"BAXR\", \"EXTR\"}})"
+            )
     elif has_receita and has_tipo_operacao:
         # Otero/Conta Azul com Tipo da operação
         tipo_col = _orig("tipo da operação") if "tipo da operação" in col_names_lower else _orig("tipo da operacao")
@@ -227,18 +237,49 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
         rules.append(f"- RESULTADO/LUCRO = SUM('{main_table}'[receita]) - SUM('{main_table}'[despesas])")
 
     # ── Status / regime de caixa ───────────────────────────────────
-    if has_cstatus:
+    if has_cstatus and has_cgrupo and has_corigem:
+        # Omie: modelo com CONTA_CORRENTE_REC + cOrigem — evitar dupla contagem
         rules.append(
-            f"- CAIXA (Omie): '{main_table}'[{_orig('cstatus')}] IN {{\"PAGO\", \"RECEBIDO\"}}"
+            f"- RECEITA CAIXA (Omie — sem dupla contagem): "
+            f"'{main_table}'[{_orig('cgrupo')}] = \"CONTA_CORRENTE_REC\" "
+            f"&& '{main_table}'[{_orig('corigem')}] IN {{\"BAXR\", \"EXTR\"}}"
+        )
+        rules.append(
+            f"  ATENÇÃO: NÃO use cStatus IN {{\"PAGO\",\"RECEBIDO\"}} para receita — "
+            f"causa dupla contagem (conta CONTA_A_RECEBER + CONTA_CORRENTE_REC)"
+        )
+        rules.append(
+            f"  cOrigem: BAXR=pagamento recebido, EXTR=extrato direto, TRAR=transferência (EXCLUIR)"
+        )
+    elif has_cstatus:
+        rules.append(
+            f"- CAIXA: '{main_table}'[{_orig('cstatus')}] IN {{\"PAGO\", \"RECEBIDO\"}}"
         )
     if has_situacao:
         situ_col = _orig("situação") if "situação" in col_names_lower else _orig("situacao")
-        rules.append(f"- STATUS: [{situ_col}] — ex: \"Pago\", \"Recebido\", \"Em aberto\", \"Vencido\", \"Cancelado\"")
-        rules.append(f"- CAIXA (Conta Azul): '{main_table}'[{situ_col}] IN {{\"Pago\", \"Recebido\"}}")
+        rules.append(f"- STATUS [{situ_col}]: \"Conciliado\"/\"Quitado\" (realizado), \"Em aberto\"/\"Atrasado\" (pendente) — campo informativo")
     if has_previsto:
-        rules.append(
-            f"- EXCLUIR CANCELADOS: '{main_table}'[{_orig('previsto/realizado')}] <> \"Cancelado\""
-        )
+        prev_col = _orig("previsto/realizado")
+        if has_situacao and has_ano_mes_cx:
+            # Conta Azul: Ano_mes É o filtro de caixa — NÃO usar Previsto/realizado
+            ano_mes_cx = _orig("ano_mes") if "ano_mes" in col_names_lower else _orig("ano_mes_caixa")
+            rules.append(
+                f"- CAIXA (Conta Azul): usar '{main_table}'[{ano_mes_cx}] = \"ANOmes\" — "
+                f"NÃO filtrar por [{prev_col}] (exclui entradas Atrasado que já foram pagas)"
+            )
+            rules.append(
+                f"  Excluir transferências: [{_orig('categoria 1') if 'categoria 1' in col_names_lower else 'Categoria 1'}] "
+                f"<> \"Transferência de Entrada\" (receita) / \"Transferência de Saída\" (despesa)"
+            )
+            rules.append(f"- PENDENTES (não pagos): '{main_table}'[{prev_col}] IN {{\"Pendente\", \"Atrasado\"}}")
+        elif has_situacao:
+            # Conta Azul sem Ano_mes — fallback para status
+            rules.append(f"- CAIXA (Conta Azul): '{main_table}'[{prev_col}] = \"Pago\"")
+            rules.append(f"- PENDENTES: '{main_table}'[{prev_col}] IN {{\"Pendente\", \"Atrasado\"}}")
+        else:
+            rules.append(
+                f"- EXCLUIR CANCELADOS: '{main_table}'[{prev_col}] <> \"Cancelado\""
+            )
     if has_cnatureza:
         rules.append(f"- [{_orig('cnatureza')}]: \"R\"=receita, \"P\"=despesa — NUNCA \"D\"")
 
@@ -279,8 +320,9 @@ def _infer_business_rules_from_tables(tables: List[Dict]) -> str:
         rules.append(
             f"- FILTRO ANO (texto): '{main_table}'[{_orig('ano ')}] = \"XXXX\" — coluna tem ESPAÇO no final"
         )
-    if has_ano_mes_cx and not has_ano:
-        rules.append(f"- FILTRO ANO (caixa texto): {_year_filter(ano_mes_cx_col)}")
+    if has_ano_mes_cx:
+        rules.append(f"- FILTRO MÊS CAIXA (preferido): {_month_filter(ano_mes_cx_col)}")
+        rules.append(f"- FILTRO ANO CAIXA: {_year_filter(ano_mes_cx_col)}")
     if has_nome_mes:
         nome_mes_col = _orig('nome mês') if 'nome mês' in col_names_lower else _orig('nome mes')
         rules.append(
